@@ -5,10 +5,12 @@ set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 URL="${1:-https://www.yuketang.cn/v2/web/index}"
 
-curl -s -X POST http://127.0.0.1:7862/stop || true
+if [[ -f "$DIR/control-token" ]]; then
+  node "$DIR/ctl.js" stop || true
+fi
 for i in $(seq 1 10); do
   sleep 1
-  if ! netstat -ano | grep -q ":7862.*LISTENING"; then
+  if ! node -e "const s=require('net').connect(7862,'127.0.0.1');s.on('connect',()=>process.exit(0));s.on('error',()=>process.exit(1))"; then
     echo "port free after ${i}s"
     break
   fi

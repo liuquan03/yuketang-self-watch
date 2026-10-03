@@ -2,12 +2,19 @@
   "name": "yuketang-helper",
   "version": "1.0.0",
   "private": true,
-  "description": "卧床看课助手：自动点播放/下一节，弹题由用户口述、助手代点",
+  "description": "雨课堂无障碍学习助手：1x视频播放和手动作业辅助",
   "main": "yuketang.js",
   "scripts": {
-    "start": "node yuketang.js"
+    "start": "node yuketang.js",
+    "status": "node ctl.js status",
+    "presence": "node ctl.js presence",
+    "homework": "node ctl.js homework",
+    "study": "node ctl.js study"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
-    "playwright-core": "^1.49.0"
+    "playwright-core": "1.63.0"
   }
 }

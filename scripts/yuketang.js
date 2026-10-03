@@ -1,21 +1,51 @@
 // 卧床看课助手 —— 在屏幕上开一个浏览器窗口播放雨课堂视频：
 //   视频暂停了自动点播放，播完了自动点"下一节"，
 //   "继续观看/我知道了"这类确认弹窗自动点掉，
-//   遇到需要作答的弹题则暂停等待，由用户口述选项、通过控制接口代点。
+//   作业页只在用户明确要求后打开，必须由用户本人作答和提交。
 // 注意：脚本绝不快进、绝不倍速 —— 时间轴必须真实走过，用户是真的在看。
 const { chromium } = require('playwright-core');
+const crypto = require('crypto');
+const fs = require('fs');
 const http = require('http');
 const path = require('path');
 
 const PORT = 7862;
-const START_URL = process.argv[2] || 'https://www.yuketang.cn/v2/web/index';
+const START_URL =
+  process.argv[2] ||
+  'https://www.yuketang.cn/v2/web/index';
 const USER_DATA = path.join(__dirname, 'user-data');
+const TOKEN_FILE = path.join(__dirname, 'control-token');
+const CONTROL_TOKEN = crypto.randomBytes(32).toString('hex');
+const MAX_BODY_BYTES = 8192;
+const PRESENCE_TTL_MS = 2000 * 60 * 1000;
+const NOTICE = ['继续观看', '继续学习', '我知道了', '知道了'];
+
+function isAllowedUrl(value) {
+  try {
+    const u = new URL(value);
+    return (
+      u.protocol === 'https:' &&
+      !u.username &&
+      !u.password &&
+      (u.hostname === 'yuketang.cn' || u.hostname.endsWith('.yuketang.cn'))
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (!isAllowedUrl(START_URL)) {
+  throw new Error('起始地址必须是 https://yuketang.cn 或其子域名');
+}
+
+fs.writeFileSync(TOKEN_FILE, CONTROL_TOKEN + '\n', { mode: 0o600 });
+fs.chmodSync(TOKEN_FILE, 0o600);
 
 const t = () => new Date().toLocaleTimeString('zh-CN');
 const log = (...a) => console.log(`[${t()}]`, ...a);
 
 const state = {
-  phase: 'starting', // starting | login | ready | watching | popup
+  phase: 'starting', // starting | login | ready | watching | popup | homework | presence | blocked
   loginOk: false,
   url: '',
   title: '',
@@ -23,12 +53,15 @@ const state = {
   popup: null,
   lastAction: '启动中',
   lastNextAt: 0,
+  manualMode: null,
+  lastVideoUrl: '',
+  presenceUntil: Date.now() + PRESENCE_TTL_MS,
   startedAt: new Date().toISOString(),
 };
 
 // ---------- 页面侧：检测（每次重新查找，无跨次引用） ----------
 async function inspect() {
-  return page.evaluate(() => {
+  return page.evaluate((notices) => {
     const vis = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
     const txt = (e) => (e.textContent || '').trim().replace(/\s+/g, ' ');
     const out = { notices: [], question: null, video: null };
@@ -36,8 +69,7 @@ async function inspect() {
     const clickables = [...document.querySelectorAll('button, [role=button], a.btn, .btn')];
 
     // 1) 单按钮提示层：继续观看 / 继续学习 / 我知道了 …
-    const NOTICE = ['继续观看', '继续学习', '我知道了', '知道了'];
-    for (const n of NOTICE) {
+    for (const n of notices) {
       if (clickables.some((e) => vis(e) && txt(e) === n)) out.notices.push(n);
     }
 
@@ -71,16 +103,19 @@ async function inspect() {
     out.video = v
       ? {
           paused: v.paused,
-          ended: v.ended,
+          ended:
+            v.ended ||
+            (Number.isFinite(v.duration) && v.duration > 0 && v.currentTime >= v.duration - 0.75),
           time: Math.round(v.currentTime),
           dur: Math.round(v.duration || 0),
           muted: v.muted,
+          rate: v.playbackRate,
         }
       : null;
 
     out.title = document.title;
     return out;
-  });
+  }, NOTICE);
 }
 
 // ---------- 页面侧：动作 ----------
@@ -105,6 +140,8 @@ async function resumePlay() {
   return page.evaluate(() => {
     const v = document.querySelector('video');
     if (!v) return false;
+    v.defaultPlaybackRate = 1;
+    v.playbackRate = 1;
     const p = v.play();
     if (p && p.catch) p.catch(() => {});
     return true;
@@ -125,18 +162,7 @@ async function clickNext() {
     const vis = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
     const txt = (e) => (e.textContent || '').trim().replace(/\s+/g, ' ');
 
-    // 策略1：明确的"下一节"按钮（兜底）
-    const RE = /^(下一节|下一个|下一任务|后一节)$/;
-    const btn = [...document.querySelectorAll('button, [role=button], a, span, div')].find(
-      (e) => vis(e) && e.children.length === 0 && RE.test(txt(e))
-    );
-    if (btn) {
-      btn.click();
-      return '按钮:' + txt(btn);
-    }
-
-    // 策略2：学习空间目录 .leaf-item —— is-active 的下一个"视频"条目；
-    // 遇到 作业/考试 等非视频条目则停下等待用户
+    // 只接受目录中明确标注为“视频”的下一项；不猜测、不进入作业或考试。
     const leaves = [...document.querySelectorAll('.leaf-item')].filter(vis);
     const idx = leaves.findIndex((e) => /(^| )is-active( |$)/.test(e.className + ''));
     if (idx >= 0) {
@@ -145,7 +171,7 @@ async function clickNext() {
         const tagEl = leaves[j].querySelector('.leaf-item-tag');
         const tag = tagEl ? tagEl.textContent.trim() : '';
         const title = txt(leaves[j].querySelector('.leaf-item-title') || leaves[j]).slice(0, 40);
-        if (tag === '视频' || (!tag && !/作业|考试|试卷|讨论/.test(title))) {
+        if (tag === '视频') {
           if (skipped.length) window.__skippedItems = skipped;
           leaves[j].click();
           return '目录:' + title + (skipped.length ? '（已跳过: ' + skipped.join('、') + '）' : '');
@@ -155,56 +181,34 @@ async function clickNext() {
       return 'NO_MORE:本课目录已到末尾' + (skipped.length ? '（后面只剩: ' + skipped.join('、') + '）' : '');
     }
 
-    // 策略3：通用目录列表（旧版页面兜底）
-    const items = [
-      ...document.querySelectorAll(
-        '[class*="lesson" i] li, [class*="catalog" i] li, [class*="chapter" i] li, [class*="task" i] li'
-      ),
-    ].filter(vis);
-    for (let i = 0; i < items.length; i++) {
-      const self = items[i];
-      const marked =
-        /(active|current|selected|doing|playing)/i.test(self.className + '') ||
-        self.getAttribute('aria-current') === 'true';
-      if (marked && items[i + 1]) {
-        items[i + 1].click();
-        return '目录下一项:' + txt(items[i + 1]).slice(0, 40);
-      }
-    }
     return null;
   });
 }
 
-async function answerQuestion(idx) {
-  return page.evaluate((idx) => {
+async function clickNextHomework() {
+  return page.evaluate(() => {
     const vis = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
     const txt = (e) => (e.textContent || '').trim().replace(/\s+/g, ' ');
-    const clickables = [...document.querySelectorAll('button, [role=button], .btn')];
-    const s = clickables.find((e) => vis(e) && /^(提交|提交答案|确定)$/.test(txt(e)));
-    if (!s) return { ok: false, err: '没找到提交按钮' };
-    let root = s;
-    for (let i = 0; i < 10 && root.parentElement; i++) {
-      root = root.parentElement;
-      const opts = [
-        ...root.querySelectorAll(
-          'li, label, [class*="option" i], [class*="choice" i], [class*="answer" i]'
-        ),
-      ].filter((e) => vis(e) && txt(e) && txt(e).length <= 120 && e !== s);
-      if (opts.length >= 2 && opts.length <= 12) {
-        if (idx < 0 || idx >= opts.length)
-          return { ok: false, err: '选项序号越界 0-' + (opts.length - 1) };
-        opts[idx].click();
-        setTimeout(() => {
-          const b = [...document.querySelectorAll('button, [role=button], .btn')].find(
-            (e) => vis(e) && /^(提交|提交答案|确定)$/.test(txt(e))
-          );
-          if (b) b.click();
-        }, 700);
-        return { ok: true, clicked: txt(opts[idx]).slice(0, 60) };
-      }
+    const leaves = [...document.querySelectorAll('.leaf-item')].filter(vis);
+    const idx = leaves.findIndex((e) => /(^| )is-active( |$)/.test(e.className + ''));
+
+    for (let j = idx >= 0 ? idx + 1 : 0; j < leaves.length; j++) {
+      const tagEl = leaves[j].querySelector('.leaf-item-tag');
+      const tag = tagEl ? txt(tagEl) : '';
+      if (!/\u4f5c\u4e1a/.test(tag) || /\u8003\u8bd5|\u6d4b\u9a8c/.test(tag)) continue;
+      const title = txt(leaves[j].querySelector('.leaf-item-title') || leaves[j]).slice(0, 80);
+      leaves[j].click();
+      return '\u4f5c\u4e1a:' + title;
     }
-    return { ok: false, err: '没找到选项容器' };
-  }, idx);
+
+    return null;
+  });
+}
+
+async function returnToVideo() {
+  if (!state.lastVideoUrl || !isAllowedUrl(state.lastVideoUrl)) return false;
+  await page.goto(state.lastVideoUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  return true;
 }
 
 // ---------- 自动脉航 ----------
@@ -213,6 +217,22 @@ async function tick() {
   if (busy) return;
   busy = true;
   try {
+    const currentIsVideo = isAllowedUrl(page.url()) && new URL(page.url()).pathname.includes('/video/');
+    if (!state.manualMode && !currentIsVideo) {
+      const videoPage = [...ctx.pages()]
+        .reverse()
+        .find((p) => !p.isClosed() && isAllowedUrl(p.url()) && new URL(p.url()).pathname.includes('/video/'));
+      if (videoPage) {
+        page = videoPage;
+        log('已自动切换到视频标签页:', page.url());
+      }
+    }
+    if (!isAllowedUrl(page.url())) {
+      state.phase = 'blocked';
+      state.url = page.url();
+      state.lastAction = '已阻止：当前页不是雨课堂安全域名';
+      return;
+    }
     const s = await inspect();
     state.url = page.url();
     state.title = s.title;
@@ -228,12 +248,24 @@ async function tick() {
       }
     }
 
+    if (state.manualMode === 'homework') {
+      await pausePlay();
+      state.phase = 'homework';
+      state.popup = s.question;
+      state.lastAction = s.question
+        ? '作业页已检测到题目；请本人在页面中作答和提交'
+        : '作业辅助模式；请本人在页面中操作';
+      return;
+    }
+
     if (s.question) {
       state.phase = 'popup';
+      await pausePlay();
       if (!state.popup || state.popup.text !== s.question.text) {
         log('⛔ 出现弹题，已暂停等待作答：', s.question.text.slice(0, 80));
       }
       state.popup = s.question;
+      state.lastAction = '检测到题目，已暂停；请本人在页面中完成';
     } else {
       state.popup = null;
       if (s.notices.length) {
@@ -243,6 +275,16 @@ async function tick() {
         if (ok) log('ℹ 自动点击提示：', n);
       } else if (s.video && !s.video.ended) {
         state.phase = 'watching';
+        if (s.video.rate !== 1) await page.evaluate(() => {
+          const v = document.querySelector('video');
+          if (v) v.playbackRate = 1;
+        });
+        if (Date.now() > state.presenceUntil) {
+          await pausePlay();
+          state.phase = 'presence';
+          state.lastAction = '在场确认已过期，视频已暂停';
+          return;
+        }
         if (s.video.paused) {
           await resumePlay();
           state.lastAction = '自动恢复播放';
@@ -252,6 +294,11 @@ async function tick() {
         }
       } else if (s.video && s.video.ended) {
         state.phase = 'watching';
+        if (Date.now() > state.presenceUntil) {
+          state.phase = 'presence';
+          state.lastAction = '在场确认已过期，未进入下一节';
+          return;
+        }
         if (Date.now() - state.lastNextAt > 8000) {
           state.lastNextAt = Date.now();
           const r = await clickNext();
@@ -265,15 +312,28 @@ async function tick() {
     }
   } catch (e) {
     state.lastAction = 'tick错误: ' + (e.message || e).slice(0, 120);
+  } finally {
+    busy = false;
   }
-  busy = false;
 }
 
 // ---------- 本地控制接口（仅 127.0.0.1） ----------
 function readBody(req) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let b = '';
-    req.on('data', (c) => (b += c));
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        const e = new Error('request body too large');
+        e.statusCode = 413;
+        reject(e);
+        req.removeAllListeners('data');
+        req.resume();
+        return;
+      }
+      b += c;
+    });
     req.on('end', () => {
       try {
         resolve(b ? JSON.parse(b) : {});
@@ -281,102 +341,100 @@ function readBody(req) {
         resolve({});
       }
     });
+    req.on('error', reject);
   });
+}
+
+function safeEqual(a, b) {
+  const aa = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 }
 
 async function handle(req, res) {
   const u = new URL(req.url, 'http://127.0.0.1');
   const send = (obj) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     res.end(JSON.stringify(obj, null, 2));
   };
   try {
+    if (!['127.0.0.1:7862', 'localhost:7862'].includes(req.headers.host || '')) {
+      res.statusCode = 403;
+      return send({ err: 'forbidden host' });
+    }
+    if (req.headers.origin) {
+      res.statusCode = 403;
+      return send({ err: 'browser-origin requests are not allowed' });
+    }
+    if (!safeEqual(req.headers['x-yuketang-token'], CONTROL_TOKEN)) {
+      res.statusCode = 401;
+      return send({ err: 'unauthorized' });
+    }
     if (u.pathname === '/status' && req.method === 'GET') {
       const s = { ...state };
       if (s.popup) s.popup = { ...s.popup, text: s.popup.text.slice(0, 200) };
+      s.presenceRemainingSeconds = Math.max(0, Math.round((state.presenceUntil - Date.now()) / 1000));
       return send(s);
     }
-    if (u.pathname === '/courses' && req.method === 'GET') {
-      const links = await page.evaluate(() =>
-        [...document.querySelectorAll('a')]
-          .filter((e) => e.offsetParent && e.textContent.trim())
-          .map((e) => ({ text: e.textContent.trim().slice(0, 50), href: e.href }))
-          .filter((x) => x.text)
-          .slice(0, 60)
-      );
-      return send({ url: page.url(), links });
-    }
-    if (u.pathname === '/dump' && req.method === 'GET') {
-      const lines = await page.evaluate(() => {
-        const out = [];
-        const walk = (e, d) => {
-          if (out.length > 400 || d > 14) return;
-          for (const c of e.children) {
-            if (!(c.offsetParent || c.getClientRects().length)) continue;
-            const tx = (c.innerText || '').trim().replace(/\s+/g, ' ');
-            if (tx && tx.length <= 80 && c.children.length <= 10)
-              out.push('  '.repeat(d) + c.tagName + '.' + String(c.className || '').slice(0, 60) + ' | ' + tx.slice(0, 80));
-            walk(c, d + 1);
-          }
-        };
-        walk(document.body, 0);
-        return out;
-      });
-      return send({ url: page.url(), lines });
-    }
-    if (u.pathname === '/goto' && req.method === 'POST') {
-      const b = await readBody(req);
-      if (!/^https?:\/\//.test(b.url || '')) return send({ ok: false, err: 'bad url' });
-      await page.goto(b.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForLoadState({ state: 'domcontentloaded' }).catch(() => {});
-      return send({ ok: true, url: page.url() });
-    }
-    if (u.pathname === '/answer' && req.method === 'POST') {
-      const b = await readBody(req);
-      const r = await answerQuestion(Number(b.index));
-      log('✍ 代答选项', b.index, JSON.stringify(r));
-      return send(r);
+    if (u.pathname === '/presence' && req.method === 'POST') {
+      state.presenceUntil = Date.now() + PRESENCE_TTL_MS;
+      state.lastAction = '已确认本人在场（20分钟）';
+      return send({ ok: true, presenceMinutes: 20 });
     }
     if (u.pathname === '/next' && req.method === 'POST') {
+      if (Date.now() > state.presenceUntil) {
+        res.statusCode = 409;
+        return send({ ok: false, err: 'presence confirmation expired' });
+      }
       const r = await clickNext();
       state.lastNextAt = Date.now();
       return send({ ok: !!r, detail: r });
+    }
+    if (u.pathname === '/homework' && req.method === 'POST') {
+      const currentUrl = page.url();
+      if (isAllowedUrl(currentUrl) && new URL(currentUrl).pathname.includes('/video/')) {
+        state.lastVideoUrl = currentUrl;
+      }
+      const r = await clickNextHomework();
+      if (!r) {
+        res.statusCode = 404;
+        return send({ ok: false, err: '没有找到目录中明确标注为作业的下一项' });
+      }
+      state.manualMode = 'homework';
+      state.phase = 'homework';
+      state.lastAction = '已打开' + r + '；等待本人作答和提交';
+      return send({ ok: true, detail: r });
+    }
+    if (u.pathname === '/study' && req.method === 'POST') {
+      const r = await returnToVideo();
+      if (!r) {
+        res.statusCode = 409;
+        return send({ ok: false, err: '没有可返回的视频页' });
+      }
+      state.manualMode = null;
+      state.lastAction = '已返回视频学习';
+      return send({ ok: true, url: state.lastVideoUrl });
     }
     if (u.pathname === '/pause' && req.method === 'POST') {
       const r = await pausePlay();
       return send({ ok: r });
     }
     if (u.pathname === '/play' && req.method === 'POST') {
+      if (Date.now() > state.presenceUntil) {
+        res.statusCode = 409;
+        return send({ ok: false, err: 'presence confirmation expired' });
+      }
       const r = await resumePlay();
       return send({ ok: r });
     }
     if (u.pathname === '/clicknotice' && req.method === 'POST') {
       const b = await readBody(req);
-      const r = await clickNotice(b.name || '继续观看');
+      const name = b.name || '继续观看';
+      if (!NOTICE.includes(name)) return send({ ok: false, err: 'notice not allowed' });
+      const r = await clickNotice(name);
       return send({ ok: r });
-    }
-    if (u.pathname === '/tabs' && req.method === 'GET') {
-      const pages = ctx.pages().map((p, i) => ({ i, url: p.url(), closed: p.isClosed() }));
-      return send({ pages, activeUrl: page.url() });
-    }
-    if (u.pathname === '/switch' && req.method === 'POST') {
-      const b = await readBody(req);
-      const pages = ctx.pages();
-      const target = pages[Number(b.index)];
-      if (!target || target.isClosed()) return send({ ok: false, err: 'no such tab' });
-      page = target;
-      return send({ ok: true, url: page.url() });
-    }
-    if (u.pathname === '/shot' && req.method === 'GET') {
-      const p = path.join(__dirname, 'ctl', 'last.png');
-      await page.screenshot({ path: p });
-      return send({ ok: true, file: p });
-    }
-    if (u.pathname === '/eval' && req.method === 'POST') {
-      const b = await readBody(req);
-      if (!b.code) return send({ ok: false, err: 'no code' });
-      const r = await page.evaluate(b.code);
-      return send({ ok: true, result: r === undefined ? null : r });
     }
     if (u.pathname === '/stop' && req.method === 'POST') {
       send({ ok: true });
@@ -386,6 +444,7 @@ async function handle(req, res) {
     }
     send({ err: 'unknown ' + req.method + ' ' + u.pathname });
   } catch (e) {
+    if (!res.headersSent) res.statusCode = e.statusCode || 500;
     send({ err: (e.message || String(e)).slice(0, 300) });
   }
 }
@@ -411,16 +470,23 @@ let ctx, page;
       args: ['--start-maximized', '--autoplay-policy=no-user-gesture-required', '--lang=zh-CN'],
     });
   }
-  page = ctx.pages()[0] || (await ctx.newPage());
+  page = ctx.pages().find((p) => isAllowedUrl(p.url())) || ctx.pages()[0] || (await ctx.newPage());
   page.on('pageerror', (err) => log('[页面脚本错误]', String(err).slice(0, 150)));
 
-  // 新标签页自动成为控制目标（雨课堂点开课时常新开页）
+  // 只跟随最终导航到雨课堂安全域名的新标签页。
   ctx.on('page', (p) => {
     log('🆕 检测到新标签页:', p.url());
-    page = p;
     p.on('pageerror', (err) => log('[页面脚本错误]', String(err).slice(0, 150)));
+    p.on('domcontentloaded', () => {
+      if (isAllowedUrl(p.url())) {
+        page = p;
+        log('已跟随雨课堂新标签页:', p.url());
+      } else {
+        log('已忽略非雨课堂标签页:', p.url());
+      }
+    });
     p.on('close', () => {
-      const rest = ctx.pages().filter((x) => !x.isClosed());
+      const rest = ctx.pages().filter((x) => !x.isClosed() && isAllowedUrl(x.url()));
       if (page === p || page.isClosed()) {
         page = rest[rest.length - 1] || page;
         log('标签页关闭，切回:', page.url());
@@ -429,9 +495,13 @@ let ctx, page;
   });
 
   const server = http.createServer(handle);
+  server.headersTimeout = 5000;
+  server.requestTimeout = 10000;
   server.listen(PORT, '127.0.0.1', () => {
     log(`助手已启动（浏览器: ${channel}，窗口应该已在你屏幕上打开）`);
     log(`控制接口: http://127.0.0.1:${PORT}/status`);
+    log(`控制令牌文件: ${TOKEN_FILE}`);
+    log('安全模式：视频仅1x；作业页需明确命令打开且由本人作答、提交');
     log('即将打开:', START_URL);
   });
   server.on('error', (e) => log('控制接口监听失败:', e.message));
