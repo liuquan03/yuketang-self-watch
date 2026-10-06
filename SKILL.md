@@ -1,11 +1,11 @@
 ---
-name: yuketang-bedside-safe
-description: 雨课堂网页版的用户在场、1x、仅视频无障碍播放助手。
+name: yuketang-self-watch
+description: Yuketang 自助观看，用于雨课堂网页版的在场学习辅助。
 ---
 
-# 雨课堂安全播放助手
+# Yuketang 自助观看
 
-仅协助本人正在观看的课程视频：续播、固定提示弹窗和明确的视频下一节。
+由 `liuquan03` 维护，协助本人观看雨课堂课程视频，处理续播、固定提示弹窗和明确的视频下一节。
 
 不可协商的边界：
 

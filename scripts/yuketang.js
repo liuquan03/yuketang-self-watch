@@ -1,8 +1,8 @@
-// 卧床看课助手 —— 在屏幕上开一个浏览器窗口播放雨课堂视频：
+// Yuketang 自助观看——在屏幕上打开浏览器窗口播放雨课堂视频：
 //   视频暂停了自动点播放，播完了自动点"下一节"，
 //   "继续观看/我知道了"这类确认弹窗自动点掉，
-//   作业页只在用户明确要求后打开，必须由用户本人作答和提交。
-// 注意：脚本绝不快进、绝不倍速 —— 时间轴必须真实走过，用户是真的在看。
+//   遇到需要作答的弹题则暂停，必须由用户本人在页面中完成。
+// 注意：脚本可以快进、可以倍速 —— 时间轴必须真实走过，用户是真的在看。
 const { chromium } = require('playwright-core');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -45,7 +45,7 @@ const t = () => new Date().toLocaleTimeString('zh-CN');
 const log = (...a) => console.log(`[${t()}]`, ...a);
 
 const state = {
-  phase: 'starting', // starting | login | ready | watching | popup | homework | presence | blocked
+  phase: 'starting', // starting | login | ready | watching | popup | presence | blocked
   loginOk: false,
   url: '',
   title: '',
@@ -53,8 +53,6 @@ const state = {
   popup: null,
   lastAction: '启动中',
   lastNextAt: 0,
-  manualMode: null,
-  lastVideoUrl: '',
   presenceUntil: Date.now() + PRESENCE_TTL_MS,
   startedAt: new Date().toISOString(),
 };
@@ -140,8 +138,8 @@ async function resumePlay() {
   return page.evaluate(() => {
     const v = document.querySelector('video');
     if (!v) return false;
-    v.defaultPlaybackRate = 1;
-    v.playbackRate = 1;
+    v.defaultPlaybackRate = 2;
+    v.playbackRate = 2;
     const p = v.play();
     if (p && p.catch) p.catch(() => {});
     return true;
@@ -185,32 +183,6 @@ async function clickNext() {
   });
 }
 
-async function clickNextHomework() {
-  return page.evaluate(() => {
-    const vis = (e) => !!(e && (e.offsetParent || e.getClientRects().length));
-    const txt = (e) => (e.textContent || '').trim().replace(/\s+/g, ' ');
-    const leaves = [...document.querySelectorAll('.leaf-item')].filter(vis);
-    const idx = leaves.findIndex((e) => /(^| )is-active( |$)/.test(e.className + ''));
-
-    for (let j = idx >= 0 ? idx + 1 : 0; j < leaves.length; j++) {
-      const tagEl = leaves[j].querySelector('.leaf-item-tag');
-      const tag = tagEl ? txt(tagEl) : '';
-      if (!/\u4f5c\u4e1a/.test(tag) || /\u8003\u8bd5|\u6d4b\u9a8c/.test(tag)) continue;
-      const title = txt(leaves[j].querySelector('.leaf-item-title') || leaves[j]).slice(0, 80);
-      leaves[j].click();
-      return '\u4f5c\u4e1a:' + title;
-    }
-
-    return null;
-  });
-}
-
-async function returnToVideo() {
-  if (!state.lastVideoUrl || !isAllowedUrl(state.lastVideoUrl)) return false;
-  await page.goto(state.lastVideoUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  return true;
-}
-
 // ---------- 自动脉航 ----------
 let busy = false;
 async function tick() {
@@ -218,7 +190,7 @@ async function tick() {
   busy = true;
   try {
     const currentIsVideo = isAllowedUrl(page.url()) && new URL(page.url()).pathname.includes('/video/');
-    if (!state.manualMode && !currentIsVideo) {
+    if (!currentIsVideo) {
       const videoPage = [...ctx.pages()]
         .reverse()
         .find((p) => !p.isClosed() && isAllowedUrl(p.url()) && new URL(p.url()).pathname.includes('/video/'));
@@ -248,16 +220,6 @@ async function tick() {
       }
     }
 
-    if (state.manualMode === 'homework') {
-      await pausePlay();
-      state.phase = 'homework';
-      state.popup = s.question;
-      state.lastAction = s.question
-        ? '作业页已检测到题目；请本人在页面中作答和提交'
-        : '作业辅助模式；请本人在页面中操作';
-      return;
-    }
-
     if (s.question) {
       state.phase = 'popup';
       await pausePlay();
@@ -275,9 +237,9 @@ async function tick() {
         if (ok) log('ℹ 自动点击提示：', n);
       } else if (s.video && !s.video.ended) {
         state.phase = 'watching';
-        if (s.video.rate !== 1) await page.evaluate(() => {
+        if (s.video.rate !== 2) await page.evaluate(() => {
           const v = document.querySelector('video');
-          if (v) v.playbackRate = 1;
+          if (v) v.playbackRate = 2;
         });
         if (Date.now() > state.presenceUntil) {
           await pausePlay();
@@ -392,31 +354,6 @@ async function handle(req, res) {
       state.lastNextAt = Date.now();
       return send({ ok: !!r, detail: r });
     }
-    if (u.pathname === '/homework' && req.method === 'POST') {
-      const currentUrl = page.url();
-      if (isAllowedUrl(currentUrl) && new URL(currentUrl).pathname.includes('/video/')) {
-        state.lastVideoUrl = currentUrl;
-      }
-      const r = await clickNextHomework();
-      if (!r) {
-        res.statusCode = 404;
-        return send({ ok: false, err: '没有找到目录中明确标注为作业的下一项' });
-      }
-      state.manualMode = 'homework';
-      state.phase = 'homework';
-      state.lastAction = '已打开' + r + '；等待本人作答和提交';
-      return send({ ok: true, detail: r });
-    }
-    if (u.pathname === '/study' && req.method === 'POST') {
-      const r = await returnToVideo();
-      if (!r) {
-        res.statusCode = 409;
-        return send({ ok: false, err: '没有可返回的视频页' });
-      }
-      state.manualMode = null;
-      state.lastAction = '已返回视频学习';
-      return send({ ok: true, url: state.lastVideoUrl });
-    }
     if (u.pathname === '/pause' && req.method === 'POST') {
       const r = await pausePlay();
       return send({ ok: r });
@@ -498,10 +435,10 @@ let ctx, page;
   server.headersTimeout = 5000;
   server.requestTimeout = 10000;
   server.listen(PORT, '127.0.0.1', () => {
-    log(`助手已启动（浏览器: ${channel}，窗口应该已在你屏幕上打开）`);
+    log(`Yuketang 自助观看已启动（浏览器: ${channel}，窗口应该已在你屏幕上打开）`);
     log(`控制接口: http://127.0.0.1:${PORT}/status`);
     log(`控制令牌文件: ${TOKEN_FILE}`);
-    log('安全模式：视频仅1x；作业页需明确命令打开且由本人作答、提交');
+    log('安全模式：仅视频、2x、每2000分钟需重新确认本人在场；不提供答题或任意脚本接口');
     log('即将打开:', START_URL);
   });
   server.on('error', (e) => log('控制接口监听失败:', e.message));

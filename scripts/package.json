@@ -1,8 +1,9 @@
 {
-  "name": "yuketang-helper",
+  "name": "yuketang-self-watch",
   "version": "1.0.0",
   "private": true,
-  "description": "雨课堂无障碍学习助手：1x视频播放和手动作业辅助",
+  "description": "Yuketang 自助观看：雨课堂视频播放与手动学习辅助",
+  "author": "liuquan03",
   "main": "yuketang.js",
   "scripts": {
     "start": "node yuketang.js",
